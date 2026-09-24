@@ -40,7 +40,10 @@ impl ApiKeyPool {
         }
 
         let now = Instant::now();
-        let current = *self.current.lock().await;
+        let current = {
+            let current_guard = self.current.lock().await;
+            *current_guard
+        };
         let mut blocked = self.blocked_until.lock().await;
         let mut cursor = current % self.clients.len();
 
