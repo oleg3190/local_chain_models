@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -37,6 +37,7 @@ fn display_name(provider: &'static str) -> &'static str {
         "openrouter" => "OpenRouter",
         "deepseek" => "DeepSeek",
         "cloudflare" => "Cloudflare",
+        "opencode-go" => "OpenCode Go",
         other => other,
     }
 }
@@ -322,11 +323,11 @@ fn to_status(status: reqwest::StatusCode) -> StatusCode {
 /// Chain of responsibility over the *enabled* providers only:
 /// OpenRouter, then DeepSeek (when `ENABLE_DEEPSEEK_FALLBACK` is on),
 /// then Cloudflare. Providers disabled via `ENABLE_*` are skipped.
-async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
+async fn fallback_chain(state: &Arc<AppState>, payload: &Value, opencode_session: Option<&str>) -> Response {
     let mut last_error: Option<(StatusCode, Vec<u8>)> = None;
 
     if let Some(provider) = &state.openrouter {
-        match forward_request(provider, payload, &state.thought_sigs).await {
+        match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
             Ok(resp) => {
                 return stream_upstream(
                     resp,
@@ -348,7 +349,7 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
     if state.config.enable_deepseek_fallback {
         if let Some(provider) = &state.deepseek {
             info!("trying DeepSeek...");
-            match forward_request(provider, payload, &state.thought_sigs).await {
+            match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
                 Ok(resp) => {
                     return stream_upstream(
                         resp,
@@ -372,7 +373,7 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
 
     if let Some(provider) = &state.cloudflare {
         info!("trying Cloudflare Workers AI...");
-        match forward_request(provider, payload, &state.thought_sigs).await {
+        match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
             Ok(resp) => {
                 return stream_upstream(
                     resp,
@@ -404,17 +405,222 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
     }
 }
 
-pub async fn chat_completions(
+
+/// Direct provider endpoint.
+///
+/// URL shape:
+///   POST /v1/opencode-go/chat/completions
+///   POST /v1/openrouter/chat/completions
+///
+/// A provider selected in the URL is called directly. No other provider
+/// participates in fallback. OpenCode Go is the only direct provider that
+/// can rotate credentials: a 429/quota marks the current key unavailable
+/// and retries the request with the next configured key.
+pub async fn provider_chat_completions(
     State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
+    let opencode_session = headers
+        .get("x-opencode-session")
+        .and_then(|v| v.to_str().ok());
+
+    match provider.as_str() {
+        "opencode-go" => direct_opencode_go(&state, &payload, opencode_session).await,
+        "gemini" => direct_single_provider(
+            &state,
+            state.gemini.as_ref(),
+            "Gemini",
+            &payload,
+            opencode_session,
+        )
+        .await,
+        "openrouter" => direct_single_provider(
+            &state,
+            state.openrouter.as_ref(),
+            "OpenRouter",
+            &payload,
+            opencode_session,
+        )
+        .await,
+        "deepseek" => direct_single_provider(
+            &state,
+            state.deepseek.as_ref(),
+            "DeepSeek",
+            &payload,
+            opencode_session,
+        )
+        .await,
+        "cloudflare" => direct_single_provider(
+            &state,
+            state.cloudflare.as_ref(),
+            "Cloudflare",
+            &payload,
+            opencode_session,
+        )
+        .await,
+        _ => openai_error(
+            StatusCode::NOT_FOUND,
+            format!("unknown provider '{provider}'"),
+        ),
+    }
+}
+
+/// Direct request to one ordinary provider. A failure is returned to the
+/// client instead of trying another provider.
+async fn direct_single_provider(
+    state: &Arc<AppState>,
+    provider: Option<&crate::providers::ProviderClient>,
+    display: &'static str,
+    payload: &Value,
+    opencode_session: Option<&str>,
+) -> Response {
+    let Some(provider) = provider else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            format!("{display} is disabled"),
+        );
+    };
+
+    // Keep Gemini's local limiter active even when it is selected explicitly.
+    if provider.name == "gemini" {
+        if let Some(remaining) = state.gemini_limiter.blocked_for().await {
+            return openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Gemini quota is temporarily blocked for {remaining}s"),
+            );
+        }
+        if !state.gemini_limiter.try_reserve().await {
+            return openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Gemini RPM limit reached",
+            );
+        }
+    }
+
+    match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
+        Ok(resp) => stream_upstream(
+            resp,
+            provider.name,
+            &provider.model,
+            state.thought_sigs.clone(),
+        ),
+        Err(e) => {
+            if provider.name == "gemini" && e.is_429() {
+                state.gemini_limiter.block_on_429(e.is_quota_429()).await;
+            }
+            let (status, body) = e.as_status_and_body();
+            Response::builder()
+                .status(to_status(status))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{display} failed"),
+                    )
+                })
+        }
+    }
+}
+
+/// OpenCode Go direct routing with per-key quota failover.
+async fn direct_opencode_go(
+    state: &Arc<AppState>,
+    payload: &Value,
+    opencode_session: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.opencode_go else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "OpenCode Go is not configured (set OPENCODE_GO_API_KEYS)",
+        );
+    };
+
+    if pool.len() == 0 {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "OpenCode Go has no configured API keys",
+        );
+    }
+
+    let mut last_error: Option<(StatusCode, Vec<u8>)> = None;
+
+    for _ in 0..pool.len() {
+        let Some((key_index, provider)) = pool.next_client().await else {
+            return openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "all OpenCode Go API keys are temporarily rate-limited/quota-exhausted",
+            );
+        };
+
+        match forward_request(
+            &provider,
+            payload,
+            &state.thought_sigs,
+            opencode_session,
+        )
+        .await
+        {
+            Ok(resp) => {
+                return stream_upstream(
+                    resp,
+                    provider.name,
+                    &provider.model,
+                    state.thought_sigs.clone(),
+                );
+            }
+            Err(e) if e.is_429() => {
+                warn!(
+                    key = key_index + 1,
+                    keys = pool.len(),
+                    "OpenCode Go key hit HTTP 429; rotating to the next key"
+                );
+                pool.mark_limited(key_index).await;
+                let (status, body) = e.as_status_and_body();
+                last_error = Some((to_status(status), body));
+            }
+            Err(e) => {
+                warn!("OpenCode Go request failed without quota/rate-limit: {e}");
+                let (status, body) = e.as_status_and_body();
+                last_error = Some((to_status(status), body));
+                break;
+            }
+        }
+    }
+
+    match last_error {
+        Some((status, body)) => Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| {
+                openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "all OpenCode Go API keys failed",
+                )
+            }),
+        None => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "all OpenCode Go API keys are temporarily rate-limited/quota-exhausted",
+        ),
+    }
+}
+
+pub async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let opencode_session = headers.get("x-opencode-session").and_then(|v| v.to_str().ok());
     let has_tools = needs_tools(&payload);
     if has_tools {
         if state.config.gemini_tools_bypass {
             info!(
                 "payload contains tools/tool_calls and GEMINI_TOOLS_BYPASS=true -> bypassing Gemini, routing to fallback chain"
             );
-            return fallback_chain(&state, &payload).await;
+            return fallback_chain(&state, &payload, opencode_session).await;
         }
         info!("payload contains tools/tool_calls -> routing to Gemini");
     }
@@ -423,21 +629,21 @@ pub async fn chat_completions(
         Some(provider) => provider,
         None => {
             info!("Gemini disabled -> routing to fallback chain");
-            return fallback_chain(&state, &payload).await;
+            return fallback_chain(&state, &payload, opencode_session).await;
         }
     };
 
     if let Some(remaining) = state.gemini_limiter.blocked_for().await {
         info!("Gemini quota-blocked for {remaining}s more -> straight to fallback");
-        return fallback_chain(&state, &payload).await;
+        return fallback_chain(&state, &payload, opencode_session).await;
     }
 
     if !state.gemini_limiter.try_reserve().await {
         info!("Gemini RPM limit reached -> straight to fallback");
-        return fallback_chain(&state, &payload).await;
+        return fallback_chain(&state, &payload, opencode_session).await;
     }
 
-    match forward_request(gemini, &payload, &state.thought_sigs).await {
+    match forward_request(gemini, &payload, &state.thought_sigs, opencode_session).await {
         Ok(resp) => stream_upstream(
             resp,
             gemini.name,
@@ -456,7 +662,7 @@ pub async fn chat_completions(
             } else {
                 warn!("Gemini call failed: {e}");
             }
-            fallback_chain(&state, &payload).await
+            fallback_chain(&state, &payload, opencode_session).await
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::config::AppConfig;
+use crate::key_pool::ApiKeyPool;
 use crate::providers::ProviderClient;
 use crate::rate_limiter::GeminiLimiter;
 use crate::thought_signatures::ThoughtSignatures;
@@ -12,6 +13,7 @@ pub struct AppState {
     pub openrouter: Option<ProviderClient>,
     pub deepseek: Option<ProviderClient>,
     pub cloudflare: Option<ProviderClient>,
+    pub opencode_go: Option<Arc<ApiKeyPool>>,
     pub gemini_limiter: GeminiLimiter,
     /// Gemini thought signatures captured from responses and replayed
     /// into later requests (see `thought_signatures.rs`).

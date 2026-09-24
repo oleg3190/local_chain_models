@@ -1,4 +1,6 @@
-use crate::config::{AppConfig, ProviderConfig};
+use crate::config::{ApiKeyPoolConfig, AppConfig, ProviderConfig};
+use crate::key_pool::ApiKeyPool;
+use std::sync::Arc;
 use crate::thought_signatures::ThoughtSignatures;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -190,6 +192,7 @@ pub async fn forward_request(
     provider: &ProviderClient,
     payload: &Value,
     signatures: &ThoughtSignatures,
+    opencode_session: Option<&str>,
 ) -> Result<Response, ProviderError> {
     let mut body = payload.clone();
 
@@ -236,6 +239,12 @@ pub async fn forward_request(
                 .header("HTTP-Referer", "http://localhost:8080")
                 .header("X-Title", "Local Qwen Agent");
         }
+        "opencode-go" => {
+            req = req.header("User-Agent", "local-chain-models/0.1");
+            if let Some(session) = opencode_session.filter(|value| !value.is_empty()) {
+                req = req.header("x-opencode-session", session);
+            }
+        }
         _ => {}
     }
 
@@ -272,6 +281,37 @@ pub struct ProviderClients {
 
 /// Builds an isolated client for every enabled provider. Disabled
 /// providers are returned as `None` and never contacted.
+/// Builds the OpenCode Go key pool. Each key gets its own isolated HTTP client,
+/// while all keys point at the same OpenCode Go endpoint/model.
+pub fn build_opencode_go_pool(cfg: &ApiKeyPoolConfig, global_proxy: Option<&str>) -> Result<Option<Arc<ApiKeyPool>>> {
+    if cfg.api_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let clients = cfg
+        .api_keys
+        .iter()
+        .map(|key| {
+            let provider_cfg = ProviderConfig {
+                api_key: key.clone(),
+                model: cfg.model.clone(),
+                use_proxy: cfg.use_proxy,
+            };
+            ProviderClient::build(
+                "opencode-go",
+                crate::config::OPENCODE_GO_URL,
+                &provider_cfg,
+                global_proxy,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(ApiKeyPool::new(
+        clients,
+        std::time::Duration::from_secs(cfg.cooldown_secs),
+    )))
+}
+
 pub fn build_clients(cfg: &AppConfig) -> Result<ProviderClients> {
     let proxy = cfg.global_outbound_proxy.as_deref();
 

@@ -1,5 +1,6 @@
 mod config;
 mod handlers;
+mod key_pool;
 mod providers;
 mod rate_limiter;
 mod state;
@@ -12,7 +13,7 @@ use axum::Router;
 use tracing_subscriber::EnvFilter;
 
 use config::AppConfig;
-use providers::build_clients;
+use providers::{build_clients, build_opencode_go_pool};
 use rate_limiter::GeminiLimiter;
 use state::AppState;
 use thought_signatures::ThoughtSignatures;
@@ -25,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let clients = build_clients(&config)?;
+    let opencode_go = build_opencode_go_pool(&config.opencode_go, config.global_outbound_proxy.as_deref())?;
 
     tracing::info!(
         proxy = ?config.global_outbound_proxy,
@@ -34,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
         openrouter = config.openrouter_enabled,
         deepseek = config.deepseek_enabled,
         cloudflare = config.cloudflare_enabled,
+        opencode_go_keys = config.opencode_go.api_keys.len(),
+        opencode_go_model = %config.opencode_go.model,
         "starting llm-router"
     );
 
@@ -57,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         openrouter: clients.openrouter,
         deepseek: clients.deepseek,
         cloudflare: clients.cloudflare,
+        opencode_go,
         gemini_limiter,
         thought_sigs,
     });
@@ -64,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/:provider/chat/completions", post(handlers::provider_chat_completions))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
