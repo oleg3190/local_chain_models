@@ -98,3 +98,62 @@ impl ApiKeyPool {
         *current = index;
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderConfig;
+    use crate::providers::ProviderClient;
+
+    fn client(key: &str) -> ProviderClient {
+        ProviderClient::build(
+            "opencode-go",
+            "http://127.0.0.1",
+            &ProviderConfig {
+                api_key: key.to_string(),
+                model: "kimi-k2.7-code".to_string(),
+                use_proxy: false,
+            },
+            None,
+        )
+        .expect("test client")
+    }
+
+    #[tokio::test]
+    async fn rotates_to_next_key_when_current_is_limited() {
+        let pool = ApiKeyPool::new(
+            vec![client("key-1"), client("key-2"), client("key-3")],
+            Duration::from_secs(3600),
+        );
+
+        let (index, first) = pool.next_client().await.expect("first key");
+        assert_eq!(index, 0);
+        assert_eq!(first.api_key, "key-1");
+
+        pool.mark_limited(index).await;
+
+        let (index, second) = pool.next_client().await.expect("second key");
+        assert_eq!(index, 1);
+        assert_eq!(second.api_key, "key-2");
+
+        pool.mark_limited(index).await;
+
+        let (index, third) = pool.next_client().await.expect("third key");
+        assert_eq!(index, 2);
+        assert_eq!(third.api_key, "key-3");
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_all_keys_are_cooling_down() {
+        let pool = ApiKeyPool::new(
+            vec![client("key-1"), client("key-2")],
+            Duration::from_secs(3600),
+        );
+
+        pool.mark_limited(0).await;
+        pool.mark_limited(1).await;
+
+        assert!(pool.next_client().await.is_none());
+    }
+}
