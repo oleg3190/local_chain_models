@@ -192,6 +192,7 @@ pub async fn forward_request(
     provider: &ProviderClient,
     payload: &Value,
     signatures: &ThoughtSignatures,
+    opencode_session: Option<&str>,
 ) -> Result<Response, ProviderError> {
     let mut body = payload.clone();
 
@@ -237,6 +238,12 @@ pub async fn forward_request(
             req = req
                 .header("HTTP-Referer", "http://localhost:8080")
                 .header("X-Title", "Local Qwen Agent");
+        }
+        "opencode-go" => {
+            req = req.header("User-Agent", "local-chain-models/0.1");
+            if let Some(session) = opencode_session.filter(|value| !value.is_empty()) {
+                req = req.header("x-opencode-session", session);
+            }
         }
         _ => {}
     }
