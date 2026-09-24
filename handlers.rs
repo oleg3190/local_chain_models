@@ -349,7 +349,7 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value, opencode_session
     if state.config.enable_deepseek_fallback {
         if let Some(provider) = &state.deepseek {
             info!("trying DeepSeek...");
-            match forward_request(provider, payload, &state.thought_sigs).await {
+            match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
                 Ok(resp) => {
                     return stream_upstream(
                         resp,
@@ -373,7 +373,7 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value, opencode_session
 
     if let Some(provider) = &state.cloudflare {
         info!("trying Cloudflare Workers AI...");
-        match forward_request(provider, payload, &state.thought_sigs).await {
+        match forward_request(provider, payload, &state.thought_sigs, opencode_session).await {
             Ok(resp) => {
                 return stream_upstream(
                     resp,
@@ -629,18 +629,18 @@ pub async fn chat_completions(
         Some(provider) => provider,
         None => {
             info!("Gemini disabled -> routing to fallback chain");
-            return fallback_chain(&state, &payload).await;
+            return fallback_chain(&state, &payload, opencode_session).await;
         }
     };
 
     if let Some(remaining) = state.gemini_limiter.blocked_for().await {
         info!("Gemini quota-blocked for {remaining}s more -> straight to fallback");
-        return fallback_chain(&state, &payload).await;
+        return fallback_chain(&state, &payload, opencode_session).await;
     }
 
     if !state.gemini_limiter.try_reserve().await {
         info!("Gemini RPM limit reached -> straight to fallback");
-        return fallback_chain(&state, &payload).await;
+        return fallback_chain(&state, &payload, opencode_session).await;
     }
 
     match forward_request(gemini, &payload, &state.thought_sigs, opencode_session).await {
@@ -662,7 +662,7 @@ pub async fn chat_completions(
             } else {
                 warn!("Gemini call failed: {e}");
             }
-            fallback_chain(&state, &payload).await
+            fallback_chain(&state, &payload, opencode_session).await
         }
     }
 }
