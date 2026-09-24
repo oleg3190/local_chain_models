@@ -9,12 +9,21 @@ pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions"
 pub const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const CLOUDFLARE_URL: &str =
     "https://api.cloudflare.com/client/v4/accounts/96c931f18046f6f5ec2413b6acb3c163/ai/v1/chat/completions";
+pub const OPENCODE_GO_URL: &str = "https://opencode.ai/zen/go/v1/chat/completions";
 
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub api_key: String,
     pub model: String,
     pub use_proxy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiKeyPoolConfig {
+    pub api_keys: Vec<String>,
+    pub model: String,
+    pub use_proxy: bool,
+    pub cooldown_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +46,7 @@ pub struct AppConfig {
     pub openrouter: ProviderConfig,
     pub deepseek: ProviderConfig,
     pub cloudflare: ProviderConfig,
+    pub opencode_go: ApiKeyPoolConfig,
     pub enable_deepseek_fallback: bool,
 
     // Model enable/disable flags
@@ -110,6 +120,11 @@ impl AppConfig {
             use_proxy: env_bool("CLOUDFLARE_USE_PROXY", false),
         };
 
+        // OpenCode Go supports multiple independent API keys. Keep the
+        // first key as the primary one and switch to the next on 429/quota.
+        let mut opencode_go_api_keys: Vec<String> = env::var("OPENCODE_GO_API_KEYS")
+            .unwrap_or_default()
+            .split(
         // Per-provider enable flags: disabled providers are never built and
         // never participate in the fallback chain, so their API keys are
         // not required.
@@ -117,8 +132,9 @@ impl AppConfig {
         let openrouter_enabled = env_bool("ENABLE_OPENROUTER", true);
         let deepseek_enabled = env_bool("ENABLE_DEEPSEEK", true);
         let cloudflare_enabled = env_bool("ENABLE_CLOUDFLARE", true);
+        let opencode_go_enabled = !opencode_go.api_keys.is_empty();
 
-        if !gemini_enabled && !openrouter_enabled && !deepseek_enabled && !cloudflare_enabled {
+        if !gemini_enabled && !openrouter_enabled && !deepseek_enabled && !cloudflare_enabled && !opencode_go_enabled {
             anyhow::bail!("all providers are disabled; enable at least one via ENABLE_* flags");
         }
 
@@ -145,7 +161,8 @@ impl AppConfig {
         let any_proxy_enabled = (gemini_enabled && gemini.use_proxy)
             || (openrouter_enabled && openrouter.use_proxy)
             || (deepseek_enabled && deepseek.use_proxy)
-            || (cloudflare_enabled && cloudflare.use_proxy);
+            || (cloudflare_enabled && cloudflare.use_proxy)
+            || (opencode_go_enabled && opencode_go.use_proxy);
         if global_outbound_proxy.is_none() && any_proxy_enabled {
             anyhow::bail!(
                 "a provider has *_USE_PROXY=true but GLOBAL_OUTBOUND_PROXY is not set"
@@ -163,6 +180,7 @@ impl AppConfig {
             openrouter,
             deepseek,
             cloudflare,
+            opencode_go,
             enable_deepseek_fallback,
             gemini_enabled,
             openrouter_enabled,
