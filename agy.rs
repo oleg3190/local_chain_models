@@ -503,6 +503,7 @@ impl AgyProvider {
 
             match timeout(heartbeat, read_json_line(&mut process.stdout)).await {
                 Ok(value) => {
+                    let value = value?;
                     let event = value.get("event").and_then(Value::as_str).unwrap_or("");
 
                     match event {
