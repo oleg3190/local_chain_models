@@ -42,7 +42,8 @@ async fn main() -> anyhow::Result<()> {
         deepseek = config.deepseek_enabled,
         cloudflare = config.cloudflare_enabled,
         agy = config.agy.enabled,
-        agy_model = %config.agy.model,
+        agy_model_id = %config.agy.model_id,
+        agy_remote_model = ?config.agy.remote_model,
         agy_fallback = config.agy.as_fallback,
         "starting llm-router"
     );
