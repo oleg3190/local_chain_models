@@ -20,7 +20,8 @@ pub struct ProviderConfig {
 pub struct AgyConfig {
     pub enabled: bool,
     pub as_fallback: bool,
-    pub model: String,
+    pub model_id: String,
+    pub remote_model: Option<String>,
     pub agent: String,
     pub effort: Option<String>,
     pub agy_path: String,
@@ -142,7 +143,8 @@ impl AppConfig {
         let agy = AgyConfig {
             enabled: agy_enabled,
             as_fallback: env_bool("AGY_AS_FALLBACK", false),
-            model: env_or("AGY_MODEL", "agy"),
+            model_id: env_or("AGY_MODEL_ID", "agy"),
+            remote_model: env::var("AGY_REMOTE_MODEL").ok().filter(|v| !v.trim().is_empty()),
             agent: env_or("AGY_AGENT", "agy-llm"),
             effort: env::var("AGY_EFFORT").ok().filter(|v| !v.trim().is_empty()),
             agy_path: env_or("AGY_PATH", "agy"),
