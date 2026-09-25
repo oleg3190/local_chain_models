@@ -30,6 +30,7 @@ pub struct AgyConfig {
     pub ssh_args: Vec<String>,
     pub remote_cwd: String,
     pub timeout: Duration,
+    pub stream_heartbeat: Duration,
     pub print_timeout_seconds: u64,
     pub allowed_init_tools: String,
     pub allow_text_fallback: bool,
@@ -140,6 +141,13 @@ impl AppConfig {
             anyhow::bail!("AGY_TIMEOUT_SECONDS must be greater than zero");
         }
 
+        let agy_stream_heartbeat_seconds: u64 = env_or("AGY_STREAM_HEARTBEAT_SECONDS", "15")
+            .parse()
+            .context("AGY_STREAM_HEARTBEAT_SECONDS must be a valid u64")?;
+        if agy_stream_heartbeat_seconds == 0 {
+            anyhow::bail!("AGY_STREAM_HEARTBEAT_SECONDS must be greater than zero");
+        }
+
         let agy = AgyConfig {
             enabled: agy_enabled,
             as_fallback: env_bool("AGY_AS_FALLBACK", false),
@@ -153,6 +161,7 @@ impl AppConfig {
             ssh_args: agy_ssh_args,
             remote_cwd: env_or("AGY_REMOTE_CWD", "."),
             timeout: Duration::from_secs(agy_timeout_seconds),
+            stream_heartbeat: Duration::from_secs(agy_stream_heartbeat_seconds),
             print_timeout_seconds: agy_timeout_seconds,
             allowed_init_tools: env_or("AGY_ALLOWED_INIT_TOOLS", "finish"),
             allow_text_fallback: env_bool("AGY_ALLOW_TEXT_FALLBACK", false),
