@@ -374,7 +374,7 @@ fn agy_openai_response(
             message["tool_calls"] = Value::Array(tool_calls);
         }
 
-        return Json(json!({
+        let mut response = json!({
             "id": id,
             "object": "chat.completion",
             "created": created,
@@ -384,8 +384,13 @@ fn agy_openai_response(
                 "message": message,
                 "finish_reason": finish_reason
             }]
-        }))
-        .into_response();
+        });
+
+        if let Some(usage) = completion.usage {
+            response["usage"] = usage;
+        }
+
+        return Json(response).into_response();
     }
 
     let mut first_delta = json!({
