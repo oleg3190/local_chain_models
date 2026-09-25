@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::time::Duration;
 
-/// Static upstream URLs — these don't change per-deployment, only the
-/// keys/models/proxy routing do.
 pub const GEMINI_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -18,28 +17,37 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct AgyConfig {
+    pub enabled: bool,
+    pub as_fallback: bool,
+    pub model: String,
+    pub agent: String,
+    pub effort: Option<String>,
+    pub agy_path: String,
+    pub ssh_binary: String,
+    pub ssh_host: String,
+    pub ssh_args: Vec<String>,
+    pub remote_cwd: String,
+    pub timeout: Duration,
+    pub print_timeout_seconds: u64,
+    pub allowed_init_tools: String,
+    pub allow_text_fallback: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub global_outbound_proxy: Option<String>,
-
     pub gemini: ProviderConfig,
     pub gemini_rpm_limit: u32,
-    /// When `true`, requests carrying `tools`/`tool_calls` skip Gemini
-    /// and go straight to the fallback chain (legacy behaviour).
-    /// Default `false`: Gemini handles tools itself (with rate limiting).
     pub gemini_tools_bypass: bool,
-    /// File the Gemini thought-signature cache is persisted to, so a
-    /// proxy restart does not lose signatures for an in-flight
-    /// conversation. `None` means memory-only.
     pub thought_sig_cache_path: Option<String>,
-
     pub openrouter: ProviderConfig,
     pub deepseek: ProviderConfig,
     pub cloudflare: ProviderConfig,
     pub enable_deepseek_fallback: bool,
-
-    // Model enable/disable flags
+    pub agy: AgyConfig,
     pub gemini_enabled: bool,
     pub openrouter_enabled: bool,
     pub deepseek_enabled: bool,
@@ -58,17 +66,17 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 impl AppConfig {
-    /// Loads and validates configuration from `.env` / process environment.
-    /// Fails fast (at startup, not mid-request) if a required key is missing.
     pub fn from_env() -> Result<Self> {
-        dotenvy::dotenv().ok(); // fine if no .env file is present
+        dotenvy::dotenv().ok();
 
         let host = env_or("SERVER_HOST", "0.0.0.0");
         let port: u16 = env_or("SERVER_PORT", "8981")
             .parse()
             .context("SERVER_PORT must be a valid u16")?;
 
-        let global_outbound_proxy = env::var("GLOBAL_OUTBOUND_PROXY").ok().filter(|s| !s.is_empty());
+        let global_outbound_proxy = env::var("GLOBAL_OUTBOUND_PROXY")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         let gemini = ProviderConfig {
             api_key: env::var("GEMINI_API_KEY").unwrap_or_default(),
@@ -81,8 +89,6 @@ impl AppConfig {
 
         let gemini_tools_bypass = env_bool("GEMINI_TOOLS_BYPASS", false);
 
-        // Persisted Gemini thought-signature cache. "off" (or empty)
-        // keeps everything in memory only.
         let thought_sig_cache_path = match env_or(
             "THOUGHT_SIG_CACHE_PATH",
             "~/.cache/llm-router/thought_signatures.jsonl",
@@ -99,26 +105,68 @@ impl AppConfig {
 
         let enable_deepseek_fallback = env_bool("ENABLE_DEEPSEEK_FALLBACK", true);
         let deepseek = ProviderConfig {
-            // DeepSeek is optional unless the fallback is actually enabled.
             api_key: env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
             model: env_or("DEEPSEEK_MODEL", "deepseek-chat"),
             use_proxy: env_bool("DEEPSEEK_USE_PROXY", false),
         };
+
         let cloudflare = ProviderConfig {
             api_key: env::var("CLOUDFLARE_API_KEY").unwrap_or_default(),
-            model: env_or("CLOUDFLARE_MODEL", "@cf/qwen/qwen2.5-coder-32b-instruct"),
+            model: env_or(
+                "CLOUDFLARE_MODEL",
+                "@cf/qwen/qwen2.5-coder-32b-instruct",
+            ),
             use_proxy: env_bool("CLOUDFLARE_USE_PROXY", false),
         };
 
-        // Per-provider enable flags: disabled providers are never built and
-        // never participate in the fallback chain, so their API keys are
-        // not required.
+        let agy_enabled = env_bool("ENABLE_AGY", false);
+        let agy_ssh_host = env::var("AGY_SSH_HOST").unwrap_or_default();
+        let agy_args_raw = env_or(
+            "AGY_SSH_ARGS_JSON",
+            r#"["-T","-o","BatchMode=yes","-o","RequestTTY=no"]"#,
+        );
+        let agy_ssh_args: Vec<String> = serde_json::from_str(&agy_args_raw)
+            .context("AGY_SSH_ARGS_JSON must be a JSON array of strings")?;
+
+        if agy_enabled && agy_ssh_host.trim().is_empty() {
+            anyhow::bail!("ENABLE_AGY=true but AGY_SSH_HOST is not set");
+        }
+
+        let agy_timeout_seconds: u64 = env_or("AGY_TIMEOUT_SECONDS", "600")
+            .parse()
+            .context("AGY_TIMEOUT_SECONDS must be a valid u64")?;
+        if agy_timeout_seconds == 0 {
+            anyhow::bail!("AGY_TIMEOUT_SECONDS must be greater than zero");
+        }
+
+        let agy = AgyConfig {
+            enabled: agy_enabled,
+            as_fallback: env_bool("AGY_AS_FALLBACK", false),
+            model: env_or("AGY_MODEL", "agy"),
+            agent: env_or("AGY_AGENT", "agy-llm"),
+            effort: env::var("AGY_EFFORT").ok().filter(|v| !v.trim().is_empty()),
+            agy_path: env_or("AGY_PATH", "agy"),
+            ssh_binary: env_or("AGY_SSH_BINARY", "ssh"),
+            ssh_host: agy_ssh_host,
+            ssh_args: agy_ssh_args,
+            remote_cwd: env_or("AGY_REMOTE_CWD", "."),
+            timeout: Duration::from_secs(agy_timeout_seconds),
+            print_timeout_seconds: agy_timeout_seconds,
+            allowed_init_tools: env_or("AGY_ALLOWED_INIT_TOOLS", "finish"),
+            allow_text_fallback: env_bool("AGY_ALLOW_TEXT_FALLBACK", false),
+        };
+
         let gemini_enabled = env_bool("ENABLE_GEMINI", true);
         let openrouter_enabled = env_bool("ENABLE_OPENROUTER", true);
         let deepseek_enabled = env_bool("ENABLE_DEEPSEEK", true);
         let cloudflare_enabled = env_bool("ENABLE_CLOUDFLARE", true);
 
-        if !gemini_enabled && !openrouter_enabled && !deepseek_enabled && !cloudflare_enabled {
+        if !gemini_enabled
+            && !openrouter_enabled
+            && !deepseek_enabled
+            && !cloudflare_enabled
+            && !agy_enabled
+        {
             anyhow::bail!("all providers are disabled; enable at least one via ENABLE_* flags");
         }
 
@@ -132,20 +180,17 @@ impl AppConfig {
             anyhow::bail!("ENABLE_CLOUDFLARE=true but CLOUDFLARE_API_KEY is not set");
         }
         if enable_deepseek_fallback && !deepseek_enabled {
-            anyhow::bail!(
-                "ENABLE_DEEPSEEK_FALLBACK=true but ENABLE_DEEPSEEK=false"
-            );
+            anyhow::bail!("ENABLE_DEEPSEEK_FALLBACK=true but ENABLE_DEEPSEEK=false");
         }
         if enable_deepseek_fallback && deepseek.api_key.is_empty() {
-            anyhow::bail!(
-                "ENABLE_DEEPSEEK_FALLBACK=true but DEEPSEEK_API_KEY is not set"
-            );
+            anyhow::bail!("ENABLE_DEEPSEEK_FALLBACK=true but DEEPSEEK_API_KEY is not set");
         }
 
         let any_proxy_enabled = (gemini_enabled && gemini.use_proxy)
             || (openrouter_enabled && openrouter.use_proxy)
             || (deepseek_enabled && deepseek.use_proxy)
             || (cloudflare_enabled && cloudflare.use_proxy);
+
         if global_outbound_proxy.is_none() && any_proxy_enabled {
             anyhow::bail!(
                 "a provider has *_USE_PROXY=true but GLOBAL_OUTBOUND_PROXY is not set"
@@ -164,6 +209,7 @@ impl AppConfig {
             deepseek,
             cloudflare,
             enable_deepseek_fallback,
+            agy,
             gemini_enabled,
             openrouter_enabled,
             deepseek_enabled,
