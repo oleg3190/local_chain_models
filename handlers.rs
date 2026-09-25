@@ -461,7 +461,7 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
 
     match provider.complete(payload).await {
         Ok(completion) => {
-            info!("-> AGY OK (model: {})", state.config.agy.model);
+            info!("-> AGY OK (model: {})", state.config.agy.model_id);
             let stream = payload
                 .get("stream")
                 .and_then(Value::as_bool)
