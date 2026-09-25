@@ -343,7 +343,7 @@ fn agy_tool_calls_json(tool_calls: &[AgyToolCall]) -> Vec<Value> {
         .collect()
 }
 
-fn agy_openai_response(completion: AgyCompletion, model: &str, stream: bool) -> Response {
+fn agy_openai_response(completion: AgyCompletion, model: &str) -> Response {
     let (id, created) = agy_request_id();
     let finish_reason = if completion.tool_calls.is_empty() {
         "stop"
@@ -352,40 +352,36 @@ fn agy_openai_response(completion: AgyCompletion, model: &str, stream: bool) -> 
     };
     let tool_calls = agy_tool_calls_json(&completion.tool_calls);
 
-    if !stream {
-        let mut message = json!({
-            "role": "assistant",
-            "content": if completion.content.is_empty() && !tool_calls.is_empty() {
-                Value::Null
-            } else {
-                Value::String(completion.content)
-            }
-        });
-
-        if !tool_calls.is_empty() {
-            message["tool_calls"] = Value::Array(tool_calls);
+    let mut message = json!({
+        "role": "assistant",
+        "content": if completion.content.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(completion.content)
         }
+    });
 
-        let mut response = json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason
-            }]
-        });
-
-        if let Some(usage) = completion.usage {
-            response["usage"] = usage;
-        }
-
-        return Json(response).into_response();
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
     }
 
-    agy_stream_response(model.to_string(), id, created, tool_calls, completion.content, completion.usage, false)
+    let mut response = json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }]
+    });
+
+    if let Some(usage) = completion.usage {
+        response["usage"] = usage;
+    }
+
+    Json(response).into_response()
 }
 
 fn agy_request_id() -> (String, u64) {
@@ -403,104 +399,6 @@ fn agy_sse(value: Value) -> Bytes {
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
     ))
 }
-
-fn agy_stream_response(
-    model: String,
-    id: String,
-    created: u64,
-    tool_calls: Vec<Value>,
-    content: String,
-    usage: Option<Value>,
-    _include_usage: bool,
-) -> Response {
-    let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
-    let mut chunks = Vec::new();
-
-    chunks.push(agy_sse(json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": { "role": "assistant" },
-            "finish_reason": Value::Null
-        }]
-    })));
-
-    if !content.is_empty() {
-        chunks.push(agy_sse(json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": { "content": content },
-                "finish_reason": Value::Null
-            }]
-        })));
-    }
-
-    for (index, call) in tool_calls.into_iter().enumerate() {
-        chunks.push(agy_sse(json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": index,
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": call["function"]["name"],
-                            "arguments": call["function"]["arguments"]
-                        }
-                    }]
-                },
-                "finish_reason": Value::Null
-            }]
-        })));
-    }
-
-    chunks.push(agy_sse(json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": finish_reason
-        }]
-    })));
-    if let Some(usage) = usage {
-        chunks.push(agy_sse(json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
-            "usage": usage
-        })));
-    }
-    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
-
-    let body = Body::from_stream(futures_util::stream::iter(
-        chunks.into_iter().map(Ok::<Bytes, std::convert::Infallible>),
-    ));
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache, no-transform")
-        .header("X-Accel-Buffering", "no")
-        .body(body)
-        .unwrap_or_else(|_| openai_error(StatusCode::BAD_GATEWAY, "failed to build AGY stream"))
-}
-
 
 fn agy_streaming_response(
     model: String,
@@ -679,7 +577,7 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
     match provider.complete(payload).await {
         Ok(completion) => {
             info!("-> AGY OK (model: {})", state.config.agy.model_id);
-            agy_openai_response(completion, &state.config.agy.model_id, false)
+            agy_openai_response(completion, &state.config.agy.model_id)
         }
         Err(error) => {
             warn!("AGY failed: {error:#}");
