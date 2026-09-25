@@ -170,7 +170,8 @@ AGY в контексте, AGY возвращает tool_calls как JSON, а l
 
 ~~~env
 ENABLE_AGY=true
-AGY_MODEL=agy
+AGY_MODEL_ID=agy
+AGY_REMOTE_MODEL=
 AGY_AGENT=agy-llm
 AGY_EFFORT=high
 AGY_SSH_HOST=agy-server
@@ -231,7 +232,9 @@ commandExecutionPolicy: off.
 использует только AGY.
 
 При AGY_AS_FALLBACK=true AGY дополнительно участвует в fallback chain после
-OpenRouter и перед DeepSeek.
+OpenRouter и перед DeepSeek. `AGY_MODEL_ID` — имя backend в OpenAI request,
+а `AGY_REMOTE_MODEL` — необязательное реальное имя модели, которое передаётся
+в `agy --model`; если оно пустое, используется модель по умолчанию Antigravity.
 
 ### Инструменты
 
