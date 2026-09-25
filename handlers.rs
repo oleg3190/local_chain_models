@@ -343,16 +343,8 @@ fn agy_tool_calls_json(tool_calls: &[AgyToolCall]) -> Vec<Value> {
         .collect()
 }
 
-fn agy_openai_response(
-    completion: AgyCompletion,
-    model: &str,
-    stream: bool,
-) -> Response {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let id = format!("chatcmpl-agy-{created}");
+fn agy_openai_response(completion: AgyCompletion, model: &str, stream: bool) -> Response {
+    let (id, created) = agy_request_id();
     let finish_reason = if completion.tool_calls.is_empty() {
         "stop"
     } else {
@@ -393,39 +385,88 @@ fn agy_openai_response(
         return Json(response).into_response();
     }
 
-    let mut first_delta = json!({
-        "role": "assistant"
-    });
+    agy_stream_response(model.to_string(), id, created, tool_calls, completion.content, completion.usage, false)
+}
 
-    if !completion.content.is_empty() {
-        first_delta["content"] = Value::String(completion.content);
-    }
-    if !tool_calls.is_empty() {
-        first_delta["tool_calls"] = Value::Array(
-            tool_calls
-                .into_iter()
-                .enumerate()
-                .map(|(index, mut call)| {
-                    call["index"] = json!(index);
-                    call
-                })
-                .collect(),
-        );
-    }
+fn agy_request_id() -> (String, u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let created = now.as_secs();
+    let id = format!("chatcmpl-agy-{}-{}", created, now.subsec_nanos());
+    (id, created)
+}
 
-    let first = json!({
+fn agy_sse(value: Value) -> Bytes {
+    Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    ))
+}
+
+fn agy_stream_response(
+    model: String,
+    id: String,
+    created: u64,
+    tool_calls: Vec<Value>,
+    content: String,
+    usage: Option<Value>,
+    _include_usage: bool,
+) -> Response {
+    let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+    let mut chunks = Vec::new();
+
+    chunks.push(agy_sse(json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": first_delta,
+            "delta": { "role": "assistant" },
             "finish_reason": Value::Null
         }]
-    });
+    })));
 
-    let final_chunk = json!({
+    if !content.is_empty() {
+        chunks.push(agy_sse(json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "content": content },
+                "finish_reason": Value::Null
+            }]
+        })));
+    }
+
+    for (index, call) in tool_calls.into_iter().enumerate() {
+        chunks.push(agy_sse(json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["function"]["name"],
+                            "arguments": call["function"]["arguments"]
+                        }
+                    }]
+                },
+                "finish_reason": Value::Null
+            }]
+        })));
+    }
+
+    chunks.push(agy_sse(json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -435,19 +476,176 @@ fn agy_openai_response(
             "delta": {},
             "finish_reason": finish_reason
         }]
-    });
+    })));
+    if let Some(usage) = usage {
+        chunks.push(agy_sse(json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage
+        })));
+    }
+    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
 
-    let body = format!(
-        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        serde_json::to_string(&first).unwrap_or_else(|_| "{}".to_string()),
-        serde_json::to_string(&final_chunk).unwrap_or_else(|_| "{}".to_string())
-    );
+    let body = Body::from_stream(futures_util::stream::iter(
+        chunks.into_iter().map(Ok::<Bytes, std::convert::Infallible>),
+    ));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("X-Accel-Buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| openai_error(StatusCode::BAD_GATEWAY, "failed to build AGY stream"))
+}
+
+
+fn agy_streaming_response(
+    model: String,
+    id: String,
+    created: u64,
+    tool_calls: Vec<Value>,
+    usage_requested: bool,
+    rx: tokio::sync::mpsc::Receiver<crate::agy::AgyStreamEvent>,
+) -> Response {
+    let first = agy_sse(json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant" },
+            "finish_reason": Value::Null
+        }]
+    }));
+
+    struct AgySseState {
+        rx: tokio::sync::mpsc::Receiver<crate::agy::AgyStreamEvent>,
+        model: String,
+        id: String,
+        created: u64,
+        pending: Vec<Bytes>,
+        usage_requested: bool,
+    }
+
+    let state = AgySseState {
+        rx,
+        model,
+        id,
+        created,
+        pending: vec![first],
+        usage_requested,
+    };
+
+    let stream = futures_util::stream::unfold(state, |mut state| async move {
+        if let Some(chunk) = state.pending.pop() {
+            return Some((Ok::<Bytes, std::convert::Infallible>(chunk), state));
+        }
+
+        match state.rx.recv().await {
+            Some(crate::agy::AgyStreamEvent::TextDelta(text)) => {
+                let chunk = agy_sse(json!({
+                    "id": state.id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": text },
+                        "finish_reason": Value::Null
+                    }]
+                }));
+                Some((Ok(chunk), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Heartbeat) => {
+                Some((Ok(Bytes::from_static(b": ping\n\n")), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Completed(completion)) => {
+                let finish_reason = if completion.tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+
+                if state.usage_requested {
+                    if let Some(usage) = completion.usage.clone() {
+                        state.pending.push(agy_sse(json!({
+                            "id": state.id,
+                            "object": "chat.completion.chunk",
+                            "created": state.created,
+                            "model": state.model,
+                            "choices": [],
+                            "usage": usage
+                        })));
+                    }
+                }
+
+                state.pending.push(Bytes::from_static(b"data: [DONE]\n\n"));
+                state.pending.push(agy_sse(json!({
+                    "id": state.id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason
+                    }]
+                })));
+
+                for (index, call) in completion.tool_calls.iter().enumerate().rev() {
+                    state.pending.push(agy_sse(json!({
+                        "id": state.id,
+                        "object": "chat.completion.chunk",
+                        "created": state.created,
+                        "model": state.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": index,
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": serde_json::to_string(&call.arguments)
+                                            .unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    })));
+                }
+
+                let next = state.pending.pop().expect("AGY completion must have a pending frame");
+                Some((Ok(next), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Error(message)) => {
+                state.pending.push(Bytes::from_static(b"data: [DONE]\n\n"));
+                state.pending.push(agy_sse(json!({
+                    "error": {
+                        "message": message,
+                        "type": "proxy_error",
+                        "code": StatusCode::BAD_GATEWAY.as_u16()
+                    }
+                })));
+                let next = state.pending.pop().expect("AGY error must have a pending frame");
+                Some((Ok(next), state))
+            }
+            None => None,
+        }
+    });
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .body(Body::from(body))
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
         .unwrap_or_else(|_| openai_error(StatusCode::BAD_GATEWAY, "failed to build AGY stream"))
 }
 
@@ -459,14 +657,31 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
         );
     };
 
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if stream {
+        let (id, created) = agy_request_id();
+        let usage_requested = payload
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return agy_streaming_response(
+            state.config.agy.model_id.clone(),
+            id,
+            created,
+            Vec::new(),
+            usage_requested,
+            provider.stream(payload),
+        );
+    }
+
     match provider.complete(payload).await {
         Ok(completion) => {
             info!("-> AGY OK (model: {})", state.config.agy.model_id);
-            let stream = payload
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            agy_openai_response(completion, &state.config.agy.model_id, stream)
+            agy_openai_response(completion, &state.config.agy.model_id, false)
         }
         Err(error) => {
             warn!("AGY failed: {error:#}");
@@ -474,6 +689,7 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
         }
     }
 }
+
 
 /// Chain of responsibility over the *enabled* providers only:
 /// OpenRouter, then DeepSeek (when `ENABLE_DEEPSEEK_FALLBACK` is on),
@@ -507,14 +723,26 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
             match agy.complete(payload).await {
                 Ok(completion) => {
                     info!("-> AGY OK (model: {})", state.config.agy.model_id);
-                    return agy_openai_response(
-                        completion,
-                        &state.config.agy.model_id,
-                        payload
-                            .get("stream")
+                    let stream = payload
+                        .get("stream")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if stream {
+                        let (id, created) = agy_request_id();
+                        let usage_requested = payload
+                            .pointer("/stream_options/include_usage")
                             .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    );
+                            .unwrap_or(false);
+                        return agy_streaming_response(
+                            state.config.agy.model_id.clone(),
+                            id,
+                            created,
+                            Vec::new(),
+                            usage_requested,
+                            agy.stream(payload),
+                        );
+                    }
+                    return agy_openai_response(completion, &state.config.agy.model_id, false);
                 }
                 Err(error) => {
                     warn!("AGY failed: {error:#}");
