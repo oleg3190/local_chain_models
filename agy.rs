@@ -166,6 +166,7 @@ impl JsonResponseStream {
                     }
                     self.closed = true;
                     self.scan_pos += 1;
+                    break;
                 }
                 0x00..=0x1f => {
                     return Err(anyhow!(
