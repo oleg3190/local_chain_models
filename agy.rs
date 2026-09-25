@@ -234,9 +234,9 @@ impl AgyProvider {
             shell_quote(AGY_OUTPUT_SCHEMA),
         ];
 
-        if let Some(model) = self.cfg.model.as_deref() {
+        if !self.cfg.model.is_empty() {
             parts.push(shell_quote("--model"));
-            parts.push(shell_quote(model));
+            parts.push(shell_quote(&self.cfg.model));
         }
 
         if let Some(effort) = self.cfg.effort.as_deref() {
