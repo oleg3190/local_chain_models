@@ -506,7 +506,6 @@ fn agy_streaming_response(
     model: String,
     id: String,
     created: u64,
-    tool_calls: Vec<Value>,
     usage_requested: bool,
     rx: tokio::sync::mpsc::Receiver<crate::agy::AgyStreamEvent>,
 ) -> Response {
@@ -672,7 +671,6 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
             state.config.agy.model_id.clone(),
             id,
             created,
-            Vec::new(),
             usage_requested,
             provider.stream(payload),
         );
@@ -720,28 +718,29 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
     if state.config.agy.as_fallback {
         if let Some(agy) = &state.agy {
             info!("trying AGY...");
+            let stream = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if stream {
+                let (id, created) = agy_request_id();
+                let usage_requested = payload
+                    .pointer("/stream_options/include_usage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return agy_streaming_response(
+                    state.config.agy.model_id.clone(),
+                    id,
+                    created,
+                    usage_requested,
+                    agy.stream(payload),
+                );
+            }
+
             match agy.complete(payload).await {
                 Ok(completion) => {
                     info!("-> AGY OK (model: {})", state.config.agy.model_id);
-                    let stream = payload
-                        .get("stream")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if stream {
-                        let (id, created) = agy_request_id();
-                        let usage_requested = payload
-                            .pointer("/stream_options/include_usage")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        return agy_streaming_response(
-                            state.config.agy.model_id.clone(),
-                            id,
-                            created,
-                            Vec::new(),
-                            usage_requested,
-                            agy.stream(payload),
-                        );
-                    }
                     return agy_openai_response(completion, &state.config.agy.model_id, false);
                 }
                 Err(error) => {
