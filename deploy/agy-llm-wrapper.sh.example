@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+exec agy \
+  --input-format stream-json \
+  --output-format stream-json \
+  --agent agy-llm \
+  --json-schema '{"type":"object","properties":{"response":{"type":"string"},"tool_calls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"arguments":{"type":"object"}},"required":["id","name","arguments"],"additionalProperties":false}}},"required":["response","tool_calls"],"additionalProperties":false}'
