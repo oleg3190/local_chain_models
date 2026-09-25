@@ -210,7 +210,7 @@ impl AgyProvider {
         info!(
             host = %self.cfg.ssh_host,
             agent = %self.cfg.agent,
-            model = ?self.cfg.model,
+            remote_model = ?self.cfg.remote_model,
             "AGY persistent backend ready"
         );
 
@@ -234,9 +234,9 @@ impl AgyProvider {
             shell_quote(AGY_OUTPUT_SCHEMA),
         ];
 
-        if !self.cfg.model.is_empty() {
+        if let Some(model) = self.cfg.remote_model.as_deref() {
             parts.push(shell_quote("--model"));
-            parts.push(shell_quote(&self.cfg.model));
+            parts.push(shell_quote(model));
         }
 
         if let Some(effort) = self.cfg.effort.as_deref() {
