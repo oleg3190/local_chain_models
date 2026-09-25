@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Instant};
 use tracing::{debug, info, warn};
 
 use crate::config::AgyConfig;
@@ -72,6 +72,193 @@ struct AgyInner {
     process: Option<AgyProcess>,
 }
 
+
+#[derive(Debug)]
+pub enum AgyStreamEvent {
+    TextDelta(String),
+    Heartbeat,
+    Completed(AgyCompletion),
+    Error(String),
+}
+
+#[derive(Debug, Default)]
+struct JsonResponseStream {
+    raw: String,
+    response_start: Option<usize>,
+    scan_pos: usize,
+    escaped: bool,
+    unicode_value: u16,
+    unicode_digits: u8,
+    pending_high_surrogate: Option<u16>,
+    closed: bool,
+    emitted: String,
+}
+
+impl JsonResponseStream {
+    fn feed(&mut self, delta: &str) -> Result<String> {
+        let before = self.emitted.len();
+        self.raw.push_str(delta);
+        self.locate_response_start();
+
+        let Some(start) = self.response_start else {
+            return Ok(String::new());
+        };
+        if self.closed {
+            return Ok(String::new());
+        }
+        if self.scan_pos < start {
+            self.scan_pos = start;
+        }
+
+        while self.scan_pos < self.raw.len() {
+            let byte = self.raw.as_bytes()[self.scan_pos];
+
+            if self.unicode_digits > 0 {
+                let digit = (byte as char)
+                    .to_digit(16)
+                    .ok_or_else(|| anyhow!("AGY response JSON contains invalid unicode escape"))?
+                    as u16;
+                self.unicode_value = (self.unicode_value << 4) | digit;
+                self.unicode_digits -= 1;
+                self.scan_pos += 1;
+                if self.unicode_digits == 0 {
+                    self.finish_unicode_code_unit()?;
+                }
+                continue;
+            }
+
+            if self.escaped {
+                self.escaped = false;
+                match byte {
+                    b'"' => self.emitted.push('"'),
+                    b'\\' => self.emitted.push('\\'),
+                    b'/' => self.emitted.push('/'),
+                    b'b' => self.emitted.push('\u{0008}'),
+                    b'f' => self.emitted.push('\u{000c}'),
+                    b'n' => self.emitted.push('\n'),
+                    b'r' => self.emitted.push('\r'),
+                    b't' => self.emitted.push('\t'),
+                    b'u' => {
+                        self.unicode_value = 0;
+                        self.unicode_digits = 4;
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "AGY response JSON contains invalid escape sequence"
+                        ));
+                    }
+                }
+                self.scan_pos += 1;
+                continue;
+            }
+
+            match byte {
+                b'\\' => {
+                    self.escaped = true;
+                    self.scan_pos += 1;
+                }
+                b'"' => {
+                    if let Some(high) = self.pending_high_surrogate.take() {
+                        return Err(anyhow!(
+                            "AGY response JSON ended with an unmatched high surrogate {:04x}",
+                            high
+                        ));
+                    }
+                    self.closed = true;
+                    self.scan_pos += 1;
+                }
+                0x00..=0x1f => {
+                    return Err(anyhow!(
+                        "AGY response JSON contains an unescaped control character"
+                    ));
+                }
+                _ => {
+                    let ch = self.raw[self.scan_pos..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| anyhow!("invalid UTF-8 in AGY response JSON"))?;
+                    if self.pending_high_surrogate.is_some() {
+                        return Err(anyhow!(
+                            "AGY response JSON contains an invalid surrogate pair"
+                        ));
+                    }
+                    self.emitted.push(ch);
+                    self.scan_pos += ch.len_utf8();
+                }
+            }
+        }
+
+        Ok(self.emitted[before..].to_string())
+    }
+
+    fn locate_response_start(&mut self) {
+        if self.response_start.is_some() {
+            return;
+        }
+        let bytes = self.raw.as_bytes();
+        let needle = b"\"response\"";
+        let mut i = 0usize;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let mut j = i + needle.len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    j += 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'"' {
+                        self.response_start = Some(j + 1);
+                        self.scan_pos = j + 1;
+                        return;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn emitted(&self) -> &str {
+        &self.emitted
+    }
+
+    fn finish_unicode_code_unit(&mut self) -> Result<()> {
+        let unit = self.unicode_value;
+        if (0xD800..=0xDBFF).contains(&unit) {
+            if self.pending_high_surrogate.replace(unit).is_some() {
+                return Err(anyhow!(
+                    "AGY response JSON contains two consecutive high surrogates"
+                ));
+            }
+            return Ok(());
+        }
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            let Some(high) = self.pending_high_surrogate.take() else {
+                return Err(anyhow!(
+                    "AGY response JSON contains a low surrogate without a high surrogate"
+                ));
+            };
+            let scalar = 0x10000 + (((high as u32) - 0xD800) << 10) + ((unit as u32) - 0xDC00);
+            let ch = char::from_u32(scalar)
+                .ok_or_else(|| anyhow!("AGY response JSON contains an invalid surrogate pair"))?;
+            self.emitted.push(ch);
+            return Ok(());
+        }
+        if let Some(high) = self.pending_high_surrogate.take() {
+            return Err(anyhow!(
+                "AGY response JSON high surrogate {:04x} was not followed by a low surrogate",
+                high
+            ));
+        }
+        let ch = char::from_u32(unit as u32)
+            .ok_or_else(|| anyhow!("AGY response JSON contains invalid unicode"))?;
+        self.emitted.push(ch);
+        Ok(())
+    }
+}
+
 pub struct AgyProvider {
     cfg: AgyConfig,
     inner: Mutex<AgyInner>,
@@ -86,6 +273,36 @@ impl AgyProvider {
     }
 
     pub async fn complete(&self, payload: &Value) -> Result<AgyCompletion> {
+        self.complete_inner(payload, None).await
+    }
+
+    pub fn stream(
+        self: &std::sync::Arc<Self>,
+        payload: &Value,
+    ) -> mpsc::Receiver<AgyStreamEvent> {
+        let (tx, rx) = mpsc::channel(64);
+        let provider = std::sync::Arc::clone(self);
+        let payload = payload.clone();
+
+        tokio::spawn(async move {
+            match provider.complete_inner(&payload, Some(&tx)).await {
+                Ok(completion) => {
+                    let _ = tx.send(AgyStreamEvent::Completed(completion)).await;
+                }
+                Err(error) => {
+                    let _ = tx.send(AgyStreamEvent::Error(format!("{error:#}"))).await;
+                }
+            }
+        });
+
+        rx
+    }
+
+    async fn complete_inner(
+        &self,
+        payload: &Value,
+        events: Option<&mpsc::Sender<AgyStreamEvent>>,
+    ) -> Result<AgyCompletion> {
         let messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -133,10 +350,24 @@ impl AgyProvider {
         };
 
         let prompt = build_prompt(&effective_delta, &tools);
-        send_user_event(inner.process.as_mut().expect("AGY process must exist"), &prompt).await?;
+        send_user_event(
+            inner
+                .process
+                .as_mut()
+                .expect("AGY process must exist"),
+            &prompt,
+        )
+        .await?;
 
         let result = match self
-            .read_result(inner.process.as_mut().expect("AGY process must exist"), &tool_names)
+            .read_result(
+                inner
+                    .process
+                    .as_mut()
+                    .expect("AGY process must exist"),
+                &tool_names,
+                events,
+            )
             .await
         {
             Ok(result) => result,
@@ -256,47 +487,107 @@ impl AgyProvider {
         &self,
         process: &mut AgyProcess,
         tool_names: &HashSet<String>,
+        events: Option<&mpsc::Sender<AgyStreamEvent>>,
     ) -> Result<AgyCompletion> {
-        let read_future = async {
-            loop {
-                let value = read_json_line(&mut process.stdout).await?;
-                let event = value.get("event").and_then(Value::as_str).unwrap_or("");
+        let started = Instant::now();
+        let mut response_stream = JsonResponseStream::default();
 
-                match event {
-                    "step_update" => {
-                        if let Some(step) = value.get("step_update") {
-                            if step.get("step_type").and_then(Value::as_str) == Some("tool") {
-                                let name = step
-                                    .get("tool_name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown");
-                                return Err(anyhow!(
-                                    "AGY attempted internal tool {}; LLM-only backend is fail-closed",
-                                    name
-                                ));
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= self.cfg.timeout {
+                return Err(anyhow!("timed out waiting for AGY result"));
+            }
+
+            let remaining = self.cfg.timeout.saturating_sub(elapsed);
+            let heartbeat = self.cfg.stream_heartbeat.min(remaining);
+
+            match timeout(heartbeat, read_json_line(&mut process.stdout)).await {
+                Ok(value) => {
+                    let event = value.get("event").and_then(Value::as_str).unwrap_or("");
+
+                    match event {
+                        "step_update" => {
+                            if let Some(step) = value.get("step_update") {
+                                if step.get("step_type").and_then(Value::as_str) == Some("tool") {
+                                    let name = step
+                                        .get("tool_name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown");
+                                    return Err(anyhow!(
+                                        "AGY attempted internal tool {}; LLM-only backend is fail-closed",
+                                        name
+                                    ));
+                                }
+
+                                if step.get("step_type").and_then(Value::as_str)
+                                    == Some("agent_response")
+                                {
+                                    if let Some(text_delta) =
+                                        step.get("text_delta").and_then(Value::as_str)
+                                    {
+                                        let visible = response_stream.feed(text_delta)?;
+                                        if !visible.is_empty() {
+                                            if let Some(tx) = events {
+                                                tx.send(AgyStreamEvent::TextDelta(visible))
+                                                    .await
+                                                    .map_err(|_| {
+                                                        anyhow!("AGY client stream was dropped")
+                                                    })?;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
+                        "result" => {
+                            let completion =
+                                parse_result(&value, tool_names, self.cfg.allow_text_fallback)?;
+
+                            if let Some(tx) = events {
+                                let streamed = response_stream.emitted();
+                                if streamed.is_empty() && !completion.content.is_empty() {
+                                    tx.send(AgyStreamEvent::TextDelta(completion.content.clone()))
+                                        .await
+                                        .map_err(|_| anyhow!("AGY client stream was dropped"))?;
+                                } else if !completion.content.starts_with(streamed) {
+                                    return Err(anyhow!(
+                                        "AGY streamed response diverged from terminal result"
+                                    ));
+                                } else if completion.content.len() > streamed.len() {
+                                    tx.send(AgyStreamEvent::TextDelta(
+                                        completion.content[streamed.len()..].to_string(),
+                                    ))
+                                    .await
+                                    .map_err(|_| anyhow!("AGY client stream was dropped"))?;
+                                }
+                            }
+
+                            return Ok(completion);
+                        }
+                        "init" => {
+                            return Err(anyhow!(
+                                "AGY emitted a second init event during a turn"
+                            ));
+                        }
+                        "error" => {
+                            return Err(anyhow!("AGY returned an error event: {value}"));
+                        }
+                        other => {
+                            debug!(event = other, "ignoring AGY stream event");
+                        }
                     }
-                    "result" => {
-                        return parse_result(&value, tool_names, self.cfg.allow_text_fallback);
-                    }
-                    "init" => {
-                        return Err(anyhow!("AGY emitted a second init event during a turn"));
-                    }
-                    "error" => {
-                        return Err(anyhow!("AGY returned an error event: {value}"));
-                    }
-                    other => {
-                        debug!(event = other, "ignoring AGY stream event");
+                }
+                Err(_) => {
+                    if let Some(tx) = events {
+                        tx.send(AgyStreamEvent::Heartbeat)
+                            .await
+                            .map_err(|_| anyhow!("AGY client stream was dropped"))?;
                     }
                 }
             }
-        };
-
-        timeout(self.cfg.timeout, read_future)
-            .await
-            .context("timed out waiting for AGY result")?
+        }
     }
+
 }
 
 async fn stop_process(inner: &mut AgyInner) {
@@ -515,6 +806,21 @@ async fn read_json_line(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_stream_extracts_incremental_json_string() {
+        let mut stream = JsonResponseStream::default();
+        assert_eq!(stream.feed(r#"{"response":"Hel"#).unwrap(), "Hel");
+        assert_eq!(stream.feed(r#"lo\nworld"}"#).unwrap(), "lo\nworld");
+        assert_eq!(stream.emitted(), "Hello\nworld");
+    }
+
+    #[test]
+    fn response_stream_decodes_surrogate_pair() {
+        let mut stream = JsonResponseStream::default();
+        assert_eq!(stream.feed(r#"{"response":"\uD83D"#).unwrap(), "");
+        assert_eq!(stream.feed(r#"\uDE80"}"#).unwrap(), "🚀");
+    }
 
     #[test]
     fn shell_quote_handles_spaces_and_quotes() {
