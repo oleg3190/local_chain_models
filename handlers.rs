@@ -461,12 +461,12 @@ async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
 
     match provider.complete(payload).await {
         Ok(completion) => {
-            info!("-> AGY OK (model: {})", state.config.agy.model_id);
+            info!("-> AGY OK (model: {})", state.config.agy.model_id_id);
             let stream = payload
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            agy_openai_response(completion, &state.config.agy.model, stream)
+            agy_openai_response(completion, &state.config.agy.model_id, stream)
         }
         Err(error) => {
             warn!("AGY failed: {error:#}");
@@ -506,10 +506,10 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
             info!("trying AGY...");
             match agy.complete(payload).await {
                 Ok(completion) => {
-                    info!("-> AGY OK (model: {})", state.config.agy.model);
+                    info!("-> AGY OK (model: {})", state.config.agy.model_id);
                     return agy_openai_response(
                         completion,
-                        &state.config.agy.model,
+                        &state.config.agy.model_id,
                         payload
                             .get("stream")
                             .and_then(Value::as_bool)
@@ -589,7 +589,7 @@ pub async fn chat_completions(
     Json(payload): Json<Value>,
 ) -> Response {
     if let Some(model) = requested_model(&payload) {
-        if model == "agy" || (state.config.agy.enabled && model == state.config.agy.model) {
+        if model == "agy" || (state.config.agy.enabled && model == state.config.agy.model_id) {
             return call_agy(&state, &payload).await;
         }
     }
