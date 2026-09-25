@@ -502,15 +502,9 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
     }
 
     if state.config.agy.as_fallback {
-        if state.agy.is_some() {
+        if let Some(agy) = &state.agy {
             info!("trying AGY...");
-            match state
-                .agy
-                .as_ref()
-                .expect("AGY checked above")
-                .complete(payload)
-                .await
-            {
+            match agy.complete(payload).await {
                 Ok(completion) => {
                     info!("-> AGY OK (model: {})", state.config.agy.model);
                     return agy_openai_response(
