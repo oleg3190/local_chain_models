@@ -1,3 +1,4 @@
+mod agy;
 mod config;
 mod handlers;
 mod providers;
@@ -11,6 +12,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tracing_subscriber::EnvFilter;
 
+use agy::AgyProvider;
 use config::AppConfig;
 use providers::build_clients;
 use rate_limiter::GeminiLimiter;
@@ -26,6 +28,11 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let clients = build_clients(&config)?;
 
+    let agy = config
+        .agy
+        .enabled
+        .then(|| Arc::new(AgyProvider::new(config.agy.clone())));
+
     tracing::info!(
         proxy = ?config.global_outbound_proxy,
         deepseek_fallback = config.enable_deepseek_fallback,
@@ -34,14 +41,16 @@ async fn main() -> anyhow::Result<()> {
         openrouter = config.openrouter_enabled,
         deepseek = config.deepseek_enabled,
         cloudflare = config.cloudflare_enabled,
+        agy = config.agy.enabled,
+        agy_model_id = %config.agy.model_id,
+        agy_remote_model = ?config.agy.remote_model,
+        agy_fallback = config.agy.as_fallback,
         "starting llm-router"
     );
 
     let gemini_limiter = GeminiLimiter::new(config.gemini_rpm_limit);
     let addr = format!("{}:{}", config.host, config.port);
 
-    // Replay the persisted signature cache so a restart does not force
-    // every in-flight conversation onto the fallback chain.
     let thought_sigs = Arc::new(ThoughtSignatures::from_setting(
         config.thought_sig_cache_path.as_deref(),
     ));
@@ -57,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         openrouter: clients.openrouter,
         deepseek: clients.deepseek,
         cloudflare: clients.cloudflare,
+        agy,
         gemini_limiter,
         thought_sigs,
     });

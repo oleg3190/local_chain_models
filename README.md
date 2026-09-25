@@ -133,3 +133,151 @@ cached thought signature`.
 docker build -t llm-router .
 docker run --rm -p 8981:8981 --env-file .env llm-router
 ```
+
+## AGY как LLM backend через SSH
+
+AGY можно использовать как отдельный LLM backend на удалённом сервере, оставив
+local_chain_models на локальном ПК. Нового HTTP-порта для AGY не требуется.
+
+Схема:
+
+~~~text
+Pi / OpenAI client
+      |
+      v
+local_chain_models :8981       (локально на ПК)
+      |
+      | ssh stdio
+      v
+NekoRay / Hysteria2 / SSH
+      |
+      v
+server: agy --input-format stream-json --output-format stream-json
+~~~
+
+AGY запускается как один persistent headless process. Router держит один
+SSH-процесс и одну conversation, поэтому повторные запросы идут в тот же AGY
+процесс. AGY headless официально поддерживает stdin stream-json, NDJSON events
+и --json-schema.
+
+Важно: AGY не является нативным OpenAI tool-calling endpoint. Для этого backend
+использует структурированный JSON-контракт: текущие OpenAI tools передаются
+AGY в контексте, AGY возвращает tool_calls как JSON, а local_chain_models
+только преобразует их обратно в OpenAI формат. Выполнение tool calls остаётся
+у внешнего агента.
+
+### Включение
+
+~~~env
+ENABLE_AGY=true
+AGY_MODEL_ID=agy
+AGY_REMOTE_MODEL=
+AGY_AGENT=agy-llm
+AGY_EFFORT=high
+AGY_SSH_HOST=agy-server
+AGY_SSH_ARGS_JSON=["-T","-o","BatchMode=yes","-o","RequestTTY=no"]
+AGY_REMOTE_CWD=/home/agy
+AGY_TIMEOUT_SECONDS=600
+AGY_ALLOWED_INIT_TOOLS=finish
+AGY_ALLOW_TEXT_FALLBACK=false
+~~~
+
+AGY_SSH_HOST должен быть обычным SSH alias из ~/.ssh/config. Это позволяет
+использовать существующий SOCKS5/NekoRay путь через ProxyCommand без
+добавления ещё одного VPN.
+
+Пример:
+
+~~~sshconfig
+Host agy-server
+    HostName SERVER_IP
+    Port 2222
+    User agy
+    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+    IdentityFile ~/.ssh/id_ed25519
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    BatchMode yes
+~~~
+
+На сервере сам AGY не должен слушать TCP-порт. Рекомендуется отдельный Unix
+user и отдельный SSH key. Дополнительные примеры ограниченного SSH key и
+wrapper находятся в deploy/.
+
+### LLM-only fail-closed режим
+
+deploy/agy-llm.agent.md — шаблон custom agent. У него пустой tools и
+commandExecutionPolicy: off.
+
+После запуска AGY router проверяет первый init event. Любой tool, который
+не входит в AGY_ALLOWED_INIT_TOOLS, приводит к отказу запуска AGY backend.
+Во время turn также запрещаются реальные AGY tool events.
+
+Это сделано намеренно: даже если конфигурация Antigravity изменится, backend
+не должен внезапно получить возможность выполнять команды или менять файлы.
+
+### Выбор модели
+
+Явный запрос:
+
+~~~json
+{
+  "model": "agy",
+  "messages": [
+    {"role": "user", "content": "Объясни этот код"}
+  ]
+}
+~~~
+
+использует только AGY.
+
+При AGY_AS_FALLBACK=true AGY дополнительно участвует в fallback chain после
+OpenRouter и перед DeepSeek. `AGY_MODEL_ID` — имя backend в OpenAI request,
+а `AGY_REMOTE_MODEL` — необязательное реальное имя модели, которое передаётся
+в `agy --model`; если оно пустое, используется модель по умолчанию Antigravity.
+
+### Инструменты
+
+Для запроса с OpenAI-compatible tools:
+
+~~~json
+{
+  "model": "agy",
+  "messages": [
+    {"role": "user", "content": "Прочитай README и скажи, что улучшить"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"}
+          },
+          "required": ["path"]
+        }
+      }
+    }
+  ]
+}
+~~~
+
+AGY вернёт структурированный результат, например tool call на read_file.
+Router ничего не исполняет и только отдаёт этот call клиенту.
+
+### CI
+
+CI проверяет:
+
+~~~bash
+cargo fmt --all -- --check
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+~~~
+
+ENABLE_AGY=false оставлен значением по умолчанию, поэтому обычный запуск
+router не требует наличия AGY или SSH на машине.
+

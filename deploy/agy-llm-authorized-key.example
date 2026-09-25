@@ -1,0 +1,3 @@
+# Example ~/.ssh/authorized_keys entry for the dedicated AGY transport user.
+# Replace /home/agy/.ssh/id_ed25519.pub with your actual public key line.
+command="/usr/local/bin/agy-llm-wrapper",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... agy-llm-client

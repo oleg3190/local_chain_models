@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -12,6 +13,7 @@ use futures_util::Stream;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::agy::{AgyCompletion, AgyToolCall};
 use crate::providers::{forward_request, needs_tools};
 use crate::state::AppState;
 use crate::thought_signatures::ThoughtSignatures;
@@ -319,6 +321,272 @@ fn to_status(status: reqwest::StatusCode) -> StatusCode {
     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
+
+fn requested_model(payload: &Value) -> Option<&str> {
+    payload.get("model").and_then(Value::as_str)
+}
+
+fn agy_tool_calls_json(tool_calls: &[AgyToolCall]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": serde_json::to_string(&call.arguments)
+                        .unwrap_or_else(|_| "{}".to_string())
+                }
+            })
+        })
+        .collect()
+}
+
+fn agy_openai_response(completion: AgyCompletion, model: &str) -> Response {
+    let (id, created) = agy_request_id();
+    let finish_reason = if completion.tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let tool_calls = agy_tool_calls_json(&completion.tool_calls);
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if completion.content.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(completion.content)
+        }
+    });
+
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    let mut response = json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }]
+    });
+
+    if let Some(usage) = completion.usage {
+        response["usage"] = usage;
+    }
+
+    Json(response).into_response()
+}
+
+fn agy_request_id() -> (String, u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let created = now.as_secs();
+    let id = format!("chatcmpl-agy-{}-{}", created, now.subsec_nanos());
+    (id, created)
+}
+
+fn agy_sse(value: Value) -> Bytes {
+    Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    ))
+}
+
+fn agy_streaming_response(
+    model: String,
+    id: String,
+    created: u64,
+    usage_requested: bool,
+    rx: tokio::sync::mpsc::Receiver<crate::agy::AgyStreamEvent>,
+) -> Response {
+    let first = agy_sse(json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant" },
+            "finish_reason": Value::Null
+        }]
+    }));
+
+    struct AgySseState {
+        rx: tokio::sync::mpsc::Receiver<crate::agy::AgyStreamEvent>,
+        model: String,
+        id: String,
+        created: u64,
+        pending: Vec<Bytes>,
+        usage_requested: bool,
+    }
+
+    let state = AgySseState {
+        rx,
+        model,
+        id,
+        created,
+        pending: vec![first],
+        usage_requested,
+    };
+
+    let stream = futures_util::stream::unfold(state, |mut state| async move {
+        if let Some(chunk) = state.pending.pop() {
+            return Some((Ok::<Bytes, std::convert::Infallible>(chunk), state));
+        }
+
+        match state.rx.recv().await {
+            Some(crate::agy::AgyStreamEvent::TextDelta(text)) => {
+                let chunk = agy_sse(json!({
+                    "id": state.id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": text },
+                        "finish_reason": Value::Null
+                    }]
+                }));
+                Some((Ok(chunk), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Heartbeat) => {
+                Some((Ok(Bytes::from_static(b": ping\n\n")), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Completed(completion)) => {
+                let finish_reason = if completion.tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+
+                if state.usage_requested {
+                    if let Some(usage) = completion.usage.clone() {
+                        state.pending.push(agy_sse(json!({
+                            "id": state.id,
+                            "object": "chat.completion.chunk",
+                            "created": state.created,
+                            "model": state.model,
+                            "choices": [],
+                            "usage": usage
+                        })));
+                    }
+                }
+
+                state.pending.push(Bytes::from_static(b"data: [DONE]\n\n"));
+                state.pending.push(agy_sse(json!({
+                    "id": state.id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason
+                    }]
+                })));
+
+                for (index, call) in completion.tool_calls.iter().enumerate().rev() {
+                    state.pending.push(agy_sse(json!({
+                        "id": state.id,
+                        "object": "chat.completion.chunk",
+                        "created": state.created,
+                        "model": state.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": index,
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": serde_json::to_string(&call.arguments)
+                                            .unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    })));
+                }
+
+                let next = state.pending.pop().expect("AGY completion must have a pending frame");
+                Some((Ok(next), state))
+            }
+            Some(crate::agy::AgyStreamEvent::Error(message)) => {
+                state.pending.push(Bytes::from_static(b"data: [DONE]\n\n"));
+                state.pending.push(agy_sse(json!({
+                    "error": {
+                        "message": message,
+                        "type": "proxy_error",
+                        "code": StatusCode::BAD_GATEWAY.as_u16()
+                    }
+                })));
+                let next = state.pending.pop().expect("AGY error must have a pending frame");
+                Some((Ok(next), state))
+            }
+            None => None,
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| openai_error(StatusCode::BAD_GATEWAY, "failed to build AGY stream"))
+}
+
+async fn call_agy(state: &Arc<AppState>, payload: &Value) -> Response {
+    let Some(provider) = &state.agy else {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGY backend is disabled or not configured",
+        );
+    };
+
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if stream {
+        let (id, created) = agy_request_id();
+        let usage_requested = payload
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return agy_streaming_response(
+            state.config.agy.model_id.clone(),
+            id,
+            created,
+            usage_requested,
+            provider.stream(payload),
+        );
+    }
+
+    match provider.complete(payload).await {
+        Ok(completion) => {
+            info!("-> AGY OK (model: {})", state.config.agy.model_id);
+            agy_openai_response(completion, &state.config.agy.model_id)
+        }
+        Err(error) => {
+            warn!("AGY failed: {error:#}");
+            openai_error(StatusCode::BAD_GATEWAY, format!("AGY backend failed: {error}"))
+        }
+    }
+}
+
+
 /// Chain of responsibility over the *enabled* providers only:
 /// OpenRouter, then DeepSeek (when `ENABLE_DEEPSEEK_FALLBACK` is on),
 /// then Cloudflare. Providers disabled via `ENABLE_*` are skipped.
@@ -343,6 +611,43 @@ async fn fallback_chain(state: &Arc<AppState>, payload: &Value) -> Response {
         }
     } else {
         info!("OpenRouter disabled -> skipping");
+    }
+
+    if state.config.agy.as_fallback {
+        if let Some(agy) = &state.agy {
+            info!("trying AGY...");
+            let stream = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if stream {
+                let (id, created) = agy_request_id();
+                let usage_requested = payload
+                    .pointer("/stream_options/include_usage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return agy_streaming_response(
+                    state.config.agy.model_id.clone(),
+                    id,
+                    created,
+                    usage_requested,
+                    agy.stream(payload),
+                );
+            }
+
+            match agy.complete(payload).await {
+                Ok(completion) => {
+                    info!("-> AGY OK (model: {})", state.config.agy.model_id);
+                    return agy_openai_response(completion, &state.config.agy.model_id, false);
+                }
+                Err(error) => {
+                    warn!("AGY failed: {error:#}");
+                }
+            }
+        } else {
+            info!("AGY fallback enabled but provider is not configured -> skipping");
+        }
     }
 
     if state.config.enable_deepseek_fallback {
@@ -408,6 +713,12 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Response {
+    if let Some(model) = requested_model(&payload) {
+        if model == "agy" || (state.config.agy.enabled && model == state.config.agy.model_id) {
+            return call_agy(&state, &payload).await;
+        }
+    }
+
     let has_tools = needs_tools(&payload);
     if has_tools {
         if state.config.gemini_tools_bypass {
